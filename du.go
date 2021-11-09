@@ -3,20 +3,53 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
+
+	"github.com/alitto/pond"
 )
+
+type pathObject struct {
+	currPath string
+	info     os.FileInfo
+	depth    int
+}
+
+func goDiskUsage(pathChan chan pathObject) int64 {
+	for {
+		path := <-pathChan
+		return diskUsage(path.currPath, path.info, path.depth)
+	}
+
+}
 
 func diskUsage(currPath string, info os.FileInfo, depth int) int64 {
 	var size int64
+
+	if *excludes != "" {
+		matched, err := regexp.MatchString(*excludes, currPath)
+
+		if err != nil {
+
+			log.Fatal(err)
+		}
+
+		if matched {
+			return size
+
+		}
+	}
 
 	dir, err := os.Open(currPath)
 	if err != nil {
 		fmt.Println(err)
 		return size
 	}
+
 	defer dir.Close()
 
 	files, err := dir.Readdir(-1)
@@ -25,13 +58,29 @@ func diskUsage(currPath string, info os.FileInfo, depth int) int64 {
 		os.Exit(1)
 	}
 
+	pool := pond.New(5, 10)
+
 	for _, file := range files {
 		if file.IsDir() {
-			size += diskUsage(fmt.Sprintf("%s/%s", currPath, file.Name()), file, depth+1)
+
+			nextPath := fmt.Sprintf("%s/%s", currPath, file.Name())
+
+			if (*maxDepth) <= 0 || (*maxDepth) < depth {
+				if threshold == 0 || size >= threshold {
+					pool.Submit(func() {
+						size += diskUsage(nextPath, file, depth+1)
+					})
+				}
+			} else {
+				size += diskUsage(nextPath, file, depth+1)
+			}
+
 		} else {
 			size += file.Size()
 		}
 	}
+
+	pool.StopAndWait()
 
 	if (*maxDepth) <= 0 || (*maxDepth) >= depth {
 		if threshold == 0 || size >= threshold {
@@ -66,6 +115,7 @@ Options:
   -h  "Human-readable" output.  Use unit suffixes: Byte, Kilobyte, Megabyte, Gigabyte.
   -t  threshold of the size, any folders' size larger than the threshold will be print. for example, '1G', '10M', '100K', '1024'
   -d  list its subdirectories and their sizes to any desired level of depth (i.e., to any level of subdirectories) in a directory tree.
+  -v  excludes folder(s) (i.e. app,.git,node_modules).
 `
 
 var (
@@ -73,11 +123,18 @@ var (
 	thresholdStr  = flag.String("t", "", "the threshold for printing the folder size")
 	threshold     int64
 	maxDepth      = flag.Int("d", 0, "list its subdirectories and their sizes to any desired level of depth (i.e., to any level of subdirectories) in a directory tree.")
+	excludes      = flag.String("v", "", "excludes folder(s) (i.e. app,.git,node_modules)")
 )
 
 func main() {
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, fmt.Sprintf(usage, runtime.NumCPU()))
+	}
+
+	pathChan := make(chan pathObject)
+
+	for i := 0; i < 10; i++ {
+		go goDiskUsage(pathChan)
 	}
 
 	flag.Parse()
